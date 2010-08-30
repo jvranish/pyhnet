@@ -3,7 +3,6 @@ from socket import *
 from thread import *
 
 
-
 HOST = ''                 # Symbolic name meaning all available interfaces
 PORT = 6112               # Arbitrary non-privileged port
 s = socket(AF_INET, SOCK_DGRAM)
