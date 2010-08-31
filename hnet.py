@@ -3,15 +3,8 @@ import pickle
 import struct
 
 class blah:
-    __init__(self):
+    __init__():
         self.identCouter = 1
-        self.messages = set()
-
-    messageRegister(self, messageIdent):
-        self.messages.add(messageIdent)
-        
-    messageRelease(self, messageIdent):
-        self.messages.discard(messageIdent)
 
 def sendWait (s, obj):
     sendDataWait(s, pickle.dumps(obj))
@@ -19,7 +12,7 @@ def sendWait (s, obj):
 def sendDataWait (s, data)
     messageIdent = self.identCounter
     self.identCounter += 1
-    if self.identCounter < 1:
+    if self.identCounter < 0:
         self.identCounter = 1
     length = len(data)
     header = struct.pack("!LL", messageIdent, length)
@@ -63,7 +56,6 @@ def recv(s):
     (data, messageIdent) = recvData(s)
     return (messageIdent, pickle.loads(data))
 
-
 class HNetSocket:
     def __init__(self):
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -88,29 +80,4 @@ class HNetSocket:
     def close(self):
         self.done = True
         self.socket.close()
-
-    def sendData(self, data, responseID = None):
-      pass
-
-    def send(self, obj, reponseID = None):
-        send
-
-    def sendAndWait(self, 
-
-    def recv(self):
-        responseID = something
-        messageID = something
-        data = stuff
-        
-        class Message:
-            def __init__(msg, data):
-                msg.data = data
-
-            def reply(msg, data):
-                self.sendResponse(responseID, data)
-
-            def replyAndWait(msg, data):
-                self.sendResponseAndWait(responseID, data)
-                
-       return Message(data)
 
