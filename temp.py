@@ -1,155 +1,85 @@
-connect (give 
-listen
-send (12k limit)
-recv (recieves one data packet < 12k)
 
-
-def connectTCP(host, port):
-    socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    return HNetSocketBasic(socket)
-
-def listenTCP(interface, port, handleNewConnection):
-    socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    socket.bind((host, port))
-    socket.listen(5)
-    def acceptor():
-        conn, addr = self.socket.accept()
-        handleNewConnection(HNetSocketBasic(conn))
         
-    thread.start_new_thread(acceptor, ())
+import socket
+import pickle
+import struct
 
+class blah:
+    __init__():
+        self.identCouter = 1
 
-#Add better timeout stuff
-class HNetSocketTCP:
-    def __init__(self, socket):
-        self.socket = socket
+def sendWait (s, obj):
+    sendDataWait(s, pickle.dumps(obj))
+
+def sendDataWait (s, data)
+    messageIdent = self.identCounter
+    self.identCounter += 1
+    if self.identCounter < 0:
+        self.identCounter = 1
+    length = len(data)
+    header = struct.pack("!LL", messageIdent, length)
+    cv = asdfasdf
+    s.registerWaitFor(cv, messageIdent)
+    s.sendall(header + data)
     
-    def send(self, data):
-        length = len(data)
-        header = struct.pack("!L", length)
-        self.socket.sendAll(header + data)
-        
-    def recvDataLen(s, length):
-        recvData = []
-        recvBytes = 0
-        
-        while recvBytes < length:
-            data = s.recv(length - recvBytes)
-            recvBytes += len(data)
-            recvData.append(data)
-        return "".join(recvData)
+    with cv:
+        cv.wait()
+    data = s.waitData[messageIdent]
+    del s.waitData[messageIdent]
+    return data
+
+
+def somewhereelse(cv):
+    cv.notify()
+
+def send(s, obj, messageIdent = 0):
+    sendData(s, pickle.dumps(obj))
+
+def sendData(s, data, messageIdent = 0):
+    length = len(data)
+    header = struct.pack("!LL", messageIdent, length)
+    s.sendall(header + data)
+
+def recvDataLen(s, length):
+    recvData = []
+    recvBytes = 0
     
-    def recv(s):
-        length = struct.unpack('!L', self.recvDataLen(s, 4))
-        return recvDataLen(s, length)
+    while recvBytes < length:
+        data = s.recv(length - recvBytes)
+        recvBytes += len(data)
+        recvData.append(data)
+    return "".join(recvData)
+
+def recvData(s):
+    (messageIdent, length) = struct.unpack('!LL', recvDataLen(s, 8))
+    return (messageIdent, recvDataLen(s, length))
         
+def recv(s):
+    (data, messageIdent) = recvData(s)
+    return (messageIdent, pickle.loads(data))
+
+class HNetSocket:
+    def __init__(self):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.done = False
+
+    def listen(self, host, port): # , acceptor = lambda x: True
+        self.socket.bind((host, port))
+        self.socket.listen(5)
+        thread.start_new_thread(self.acceptConnections, ())
+
+    def acceptConnections(self):
+        while not self.done:
+            conn, addr = self.socket.accept()
+            self.accept(conn, addr)
+
+    def accept(self, conn, addr):
+        pass
+        
+    def connect(self, host, port):
+        self.socket.connect((host, port))
+
     def close(self):
+        self.done = True
         self.socket.close()
 
-class HNetStream:
-    def __init__(self, socket):
-        self.socket = socket
-        self.recvQueue = Queue()
-        self.
-
-    def send(self, data):
-
-    def recv(self):
-        return self.recvQueue.get(True)
-
-
-class HNetSendWait:
-    def __init__(self, socket):
-        self.socket = socket
-        self.seq = 1
-        self.lock = Lock()
-
-    def send(self, data):
-        with self.lock()
-            self.seq += 1
-            if self.seq < 0:
-                self.seq = 1
-        header = struct.pack("!L", self.seq)
-        self.send(header + data)
-        
-    def recv(s):
-        seq = struct.unpack('!L', s[:4])
-        class Packet:
-            def respond(msg):
-                self.socket.
-
-            def data():
-                return s4:]
-            
-        return Packet()
-        
-    def close(self):
-        self.socket.close()
-
-    
-
-class HNetStream(HNetSocketBasic):
-
-sendAndWait
-makeStream()
-
-
-
-Client:
-mySocket = Thingy(host)
-s = mySocket.makeStream("blah")
-s.send(mydata)
-
-
-
-
-
-Host:
-
-obj, stream = mySocket.recv()
-if obj:
-    obj.respond(someData)
-    
-if stream:
-    
-
-if isStream(obj, s):
-    s, = 
-if obj.isStream:
-    header = obj.recv()
-    if header == "Chat":
-        spawnNewChatWindow(ojb)
-else:
-    obj.data
-    obj.respond()
-
-
-
-
-mySocket.listenStream()
-
-
-
-
-
-
-
-small data
-big data
-
-packets that must get there
-packets that we don't care if they get there
-
-needs responses
-
-
-
-
-
-GameInfo: Done
-Text: Done
-Files: 
-Authentication(LATER)
-
-thing = recv()
-thing.respond(asdfjjsdalf)
