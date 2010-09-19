@@ -1,5 +1,6 @@
 import unittest
 import threading
+from threading import Event, Lock, Condition
 import socket
 import select
 import time
@@ -10,12 +11,16 @@ testPort = 30131
 
 # sanity checker
 class TestSocket(unittest.TestCase):
-    def asdftest_SocketTCPAcceptClose(self):
+    def threadStops(self, thread):
+        thread.join(1.0)
+        self.assertFalse(thread.isAlive())
+        
+    def test_SocketTCPAcceptClose(self):
         serverListenSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         serverListenSocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         serverListenSocket.bind(('localhost', testPort))
         serverListenSocket.listen(5)
-        serverListenSocket.settimeout(0.01)
+        serverListenSocket.settimeout(0.001)
         done = Event()
         def acceptor():
             while not done.isSet():
@@ -30,16 +35,14 @@ class TestSocket(unittest.TestCase):
         clientSocket.close()
         done.set()
         serverListenSocket.close()
-        
-        thread.join(1.0)
-        self.assertFalse(thread.isAlive())
+        self.threadStops(thread)
         
     def test_SocketTCPReadUnblockOnShutdown(self):
         serverListenSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         serverListenSocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         serverListenSocket.bind(('localhost', testPort))
         serverListenSocket.listen(5)
-        serverListenSocket.settimeout(0.01)
+        serverListenSocket.settimeout(0.001)
         done = Event()
         def acceptor():
             while not done.isSet():
@@ -47,25 +50,27 @@ class TestSocket(unittest.TestCase):
                     conn, addr = serverListenSocket.accept()
                 except socket.timeout:
                     pass
+                except socket.error, e:
+                    if not done.isSet():
+                        raise
+                
         thread = startNewThread(acceptor)
         clientSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         clientSocket.connect(('localhost', testPort))
         def closer():
             time.sleep(0.01)
-            #clientSocket.shutdown(socket.SHUT_RDWR)
-            #clientSocket._sock.close()
+            clientSocket.shutdown(socket.SHUT_RDWR)
             clientSocket.close()
             
-        startNewThread(closer)
-        r, w, e = select.select([clientSocket],[],[], None)
-        try:
-          clientSocket.recv(20)
-        except:
-          pass
+            
         done.set()
-        thread.join(1.0)
         serverListenSocket.close()
-        self.assertFalse(thread.isAlive())
+        closerThread = startNewThread(closer)
+        
+        clientSocket.recv(1)
+        
+        self.threadStops(thread)
+        self.threadStops(closerThread)
 
 class TestObj():
     def __init__(self, a):
@@ -78,17 +83,65 @@ class TestObj():
         return 1 + ''
                 
 class TestHNet(unittest.TestCase):
+  
+    def setUp(self):
+        self.client = None
+        self.server = None
+        self.listen = None
+        
+    def tearDown(self):
+        if self.client:
+            self.client.close()
+        if self.server:
+            self.server.close()
+        if self.listen:
+            self.listen.stop()
         
     def test_TCPConnectAndClose(self):
         def handleConnect(s, addr):
-          listenThread.stopListening()
-        listenThread = listenTCP([('', testPort)], handleConnect)
-        self.assertTrue(listenThread.isAlive())
+            pass
+        server = HNetTCPServer([('', testPort)], handleConnect)
+        server.start()
+        self.assertTrue(server.thread.isAlive())
         with connectTCP('localhost', testPort) as _:
             pass
-        listenThread.join(1.0)
-        self.assertFalse(listenThread.isAlive())
+        server.stop()
+        self.threadStops(server.thread)
+        
+    def test_TCPBindPortInvalid(self):
+        server = HNetTCPServer([('', testPort), ('', testPort)], lambda s, addr: None)
+        self.assertRaises(ServerStartFail, server.start)
+        
+    def test_TCPBindHostInvalid(self):
+        server = HNetTCPServer([('someInvalidHostName', testPort)], lambda s, addr: None)
+        self.assertRaises(HostInvalid, server.start)
+        
+    def test_TCPConnectHostInvalid(self):
+        def tryConnect():
+            with connectTCP('someInvalidHostName', testPort, timeout = 0.000001) as _:
+                pass
+        self.assertRaises(HostInvalid, tryConnect)
+        
+    def test_TCPConnectRejected(self):
+        def tryConnect():
+            with connectTCP('localhost', testPort, timeout = 0.000001) as _:
+                pass
 
+        self.assertRaises(ConnectFailed, tryConnect)
+    
+    def test_TCPConnectReset(self):
+        serverListenSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        serverListenSocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        serverListenSocket.bind(('localhost', testPort))
+        serverListenSocket.listen(1)
+        def tryConnect():
+            with connectTCP('localhost', testPort, timeout = 0.00001) as s:
+                serverListenSocket.close()
+                s.send('asdf')
+            
+        self.assertRaises(ConnectionClosed, tryConnect)
+    
+    
     def test_HNetSocketTCPServerSendClientRecv(self):
         def forServer(s):
             s.send("asdf")
@@ -101,8 +154,23 @@ class TestHNet(unittest.TestCase):
             s.close()
         self.connectAndRun(forServer, forClient)
         
-    def test_HNetProxy(self):
+    def test_HNetSocketTCPBrokenPipe(self):
+        def forServer(s):
+            def doSend():
+                while True:
+                  s.send("the quick brown fox jumps over whatever")
+            self.assertRaises(ConnectionClosed, doSend)
+            s.close()
+            
+        def forClient(s):
+            for packet in s.recv():
+                s.close()
+
+        self.connectAndRun(forServer, forClient)
         
+    #TODO add case for shutdown while waiting for a response
+        
+    def test_HNetProxy(self):
         
         def forServer(s):
             s = HNetSendWait(s)
@@ -112,56 +180,73 @@ class TestHNet(unittest.TestCase):
                 obj.setA(10)
                 self.assertEqual(obj.getA(), 10)
                 self.assertRaises(TypeError, obj.testError)
-                
-                time.sleep(0.01)
-                #print "done waiting"
                 s.close()
-                
-                
+            
             for packet in s.recv():
                 if packet.msg() == 'testProxy':
-                    obj = getProxy(packet)
-                    startNewThread(runTest, (s, obj))
+                    startNewThread(runTest, (s, packet.proxy()))
                
-            
         def forClient(s):
             s = HNetSendWait(s)
             testObj = TestObj(5)
             s.sendProxy(testObj, 'testProxy')
-            for packet in s.recv():
+            for _ in s.recv():
                 pass
+            
             s.close()
             self.assertEqual(testObj.a, 10)
             
+        self.connectAndRun(forServer, forClient)
+        
+    def test_HNetBigMsg(self):
+        bigMsg = 'This is a big message maybe'*5000
+        def forServer(s):
+            s = HNetSendWait(s)
+            
+            def runTest(s, packet):
+                recievedBigMsg = packet.bigMsg()
+                self.assertEqual(bigMsg, recievedBigMsg)
+                s.close()
+            
+            for packet in s.recv():
+                if packet.msg() == 'my big message':
+                    startNewThread(runTest, (s, packet))
+               
+        def forClient(s):
+            s = HNetSendWait(s)
+            startNewThread(s.sendBigMsg, ('my big message', bigMsg))
+            for _ in s.recv():
+                pass
+            
+            s.close()
             
         self.connectAndRun(forServer, forClient)
       
-        
     def connectAndRun(self, serverStuff, clientStuff):
-        x = {}
-        #TODO fix this, figure out a better way to track the serverStuff thread
-        #  maybe start thread automatically? no? hmmm
+        serverDone  = Event()
         def handleConnect(serverSocket, addr):
-            def runServerStuff():
-                with serverSocket as s:
-                    serverStuff(s)
-            x['serverThread'] = startNewThread(runServerStuff)
-            
+            with serverSocket as s:
+                self.server = serverSocket
+                serverStuff(s)
+            serverDone.set()
 
-        listenThread = listenTCP([('', testPort)], handleConnect, 0.01)
-        def clientThread():        
+        server = HNetTCPServer([('', testPort)], handleConnect, 0.001)
+        self.listen = server
+        server.start()
+        def runClientStuff():        
             with connectTCP('localhost', testPort) as clientSocket:
+                self.client = clientSocket
                 clientStuff(clientSocket)
-        ct = startNewThread(clientThread)
-        ct.join(1.0)
-        listenThread.stopListening()
-        listenThread.join(1.0)
-        x['serverThread'].join(1.0)
-        self.assertFalse(x['serverThread'].isAlive())
-        self.assertFalse(ct.isAlive())
-        self.assertFalse(listenThread.isAlive())
-
-
+        clientThread = startNewThread(runClientStuff)
+        self.threadStops(clientThread)
+        server.stop()
+        self.threadStops(server.thread)
+        serverDone.wait(1.0)
+        self.assertTrue(serverDone.isSet())
+    
+    def threadStops(self, thread):
+        thread.join(1.0)
+        self.assertFalse(thread.isAlive())
         
 
 if __name__ == '__main__':

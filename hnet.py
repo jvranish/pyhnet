@@ -8,14 +8,52 @@ import traceback
 import errno
 import select
 
-#TODO pickle tracebacks
+
+#TODO add support for alternate thread libraries
+#TODO add log entries
+# check - TODO pickle tracebacks
 #TODO add some handling for connections that are terminated midstream
+#    make group of exceptions thrown from connect, close, resv, send, listen
+#    collect possible socket exceptions
+#    also consider queue fill exceptions
+#    if stream breaks we need to shutdown all the queues
 #TODO allow our sockets and stream to operate like a standard socket, or like a with statement object
+#TODO timeout cancel proxy computation (thread them, how to kill on fail?)
+# TODO put a timeout option on the sendAndWait somehow
+
 
 def startNewThread(target, args = (), kwargs = {}):
     thread = Thread(target = target, args = args, kwargs = kwargs)
     thread.start()
     return thread
+
+    
+ERRNO_RETRIES=[errno.EINTR, errno.EAGAIN, errno.EWOULDBLOCK]
+if hasattr(errno, "WSAEINTR"):
+    ERRNO_RETRIES.append(errno.WSAEINTR)
+if hasattr(errno, "WSAEWOULDBLOCK"):
+    ERRNO_RETRIES.append(errno.WSAEWOULDBLOCK)
+
+ERRNO_BADF=[errno.EBADF]
+if hasattr(errno, "WSAEBADF"):
+    ERRNO_BADF.append(errno.WSAEBADF)
+    
+def retryable(e):
+    err=getattr(e,"errno",e.args[0])
+    return err in ERRNO_RETRIES
+        
+def isBadSocket(e):
+    err=getattr(e,"errno",e.args[0])
+    return err in ERRNO_BADF or err == errno.ECONNRESET
+    
+class ConnectionError(Exception): pass
+class ConnectFailed(Exception): pass
+class ConnectionClosed(ConnectionError): pass
+class ConnectionTimedOut(ConnectionError): pass
+class UnknownConnectionError(ConnectionError): pass
+class UnknownServerError(ConnectionError): pass
+class HostInvalid(ConnectionError): pass
+class ServerStartFail(ConnectionError): pass
 
 
 def connectTCP(host, port, maxAttempts = 3, timeout = 1.0):
@@ -33,53 +71,75 @@ def connectTCP(host, port, maxAttempts = 3, timeout = 1.0):
             if tries < maxAttempts:
                 tries += 1
             else:
-                raise
+                raise ConnectionTimedOut
+        except socket.gaierror, e:
+            raise HostInvalid, e
+        except socket.error, e:
+            raise ConnectFailed, e
+        
     return HNetSocketTCP(clientSocket)
     
-
-def listenTCP(addresses, handleNewConnection, timeout = 0.1):
-    listenSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listenSocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        for address in addresses: # (host, port)
-            listenSocket.bind(address)
-        listenSocket.listen(5)
-        done = Event()
-        def acceptor():
+class HNetTCPServer:
+    def __init__(self, addresses, newConnectionHandler, timeout = 0.1):
+        self.stopped = True
+        self.lock = Lock()
+        self.socket = None
+        self.timeout = timeout
+        self.addresses = addresses
+        self.handler = newConnectionHandler
+        self.thread = None
+    
+    def start(self):
+        if self.stopped:
             try:
-                listenSocket.settimeout(timeout)
-                while not done.isSet():
-                    try:
-                        conn, addr = listenSocket.accept()
-                        handleNewConnection(HNetSocketTCP(conn), addr)
-                    except socket.timeout:
-                        pass
-            finally:
-                listenSocket.close()
-    except:
-        listenSocket.close()
-        raise
-    thread = startNewThread(acceptor)
-    def stopListening():
-        done.set()
-    thread.stopListening = stopListening
-    thread.socket = listenSocket
-    return thread
+                self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.stopped = False
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self.socket.settimeout(self.timeout)
+                for address in self.addresses: # (host, port)
+                    self.socket.bind(address)
+                self.socket.listen(5)
+            except socket.gaierror, e:
+                raise HostInvalid, e
+            except socket.error, e:
+                raise ServerStartFail, e
+            except:
+                self.stop()
+                raise
+            self.thread = startNewThread(self.__acceptor)
+                def __acceptor(self):
+        try:
+            while not self.stopped:
+                try:
+                    conn, addr = self.socket.accept()
+                    startNewThread(self.handler, (HNetSocketTCP(conn), addr))
+                except socket.timeout:
+                    pass
+                except socket.error, e:
+                    if not self.stopped:
+                        raise UnknownServerError,  e
+        finally:
+            self.stop()
+            self.socket = None
+        
+    def stop(self):
+        with self.lock:
+            if not self.stopped:
+                self.stopped = True
+                self.socket.close()
 
-#TODO this might be a good idea, should I add other exceptions?
-class ConnectionClosed(Exception):
-    pass
-#Add better timeout stuff
+
+
+
 class HNetSocketTCP:
     def __init__(self, s): 
         # socket must support, send(), recv(), and close(),
         # where send and recv operate on single data packets 
         self.socket = s
-        #TODO make some sort of test and set primative
         self.lock = Lock()
         self.closed = False
-        #self.socket.settimeout(0.0)
-        self.socket.setblocking(0)
+        self.socket.settimeout(0.0)
+        self.socket.setblocking(1)
         
     def __enter__(self):
         return self
@@ -90,128 +150,153 @@ class HNetSocketTCP:
     def send(self, data):
         length = len(data)
         header = struct.pack("!L", length)
-        buffer = header + data
-        while buffer:
-            r, w, e = select.select([],[self.socket],[])
-            sent = self.socket.send(buffer)
-            buffer = buffer[sent:]
-        
-        #self.socket.sendall()
-        
+        try:
+            self.socket.sendall(header + data)
+        except socket.timeout:
+            raise ConnectionTimedOut
+        except socket.error, e:
+            raise ConnectionClosed, e
+            
     def __recvDataLen(self, length):
         recvData = []
         recvBytes = 0
-        #TODO add more error checking/retrying, perhaps compare to pyro code
         while recvBytes < length:
-            r, w, e = select.select([self.socket],[],[])
-            data = self.socket.recv(length - recvBytes)
-            if not data: raise ConnectionClosed
-            recvBytes += len(data)
-            recvData.append(data)
+            try:
+                data = self.socket.recv(length - recvBytes)
+                if not data: raise ConnectionClosed
+                recvBytes += len(data)
+                recvData.append(data)
+            except socket.error, e:
+                if retryable(e):
+                    time.sleep(0.00001)
+                    continue
+                else:
+                    raise
         return "".join(recvData)
     
     def recv(self):
         while True:
             try:
                 length, = struct.unpack('!L', self.__recvDataLen(4))
-                data = self.__recvDataLen(length)
-                if data == None: break
-                yield data
+                yield self.__recvDataLen(length)
             except ConnectionClosed:
                 break
-            except socket.error, (errnum, msg):
-                if errnum == errno.EBADF:
-                    break  # almost certainly socket was closed
-                elif errnum == errno.ECONNRESET: # test shutdown
-                    break
-                else:
-                    raise
+            except socket.timeout:
+                raise ConnectionTimedOut
+            except socket.error, e:
+                break # connection was probably closed
+                # it's hard to tell if this is an error, or if the other side just did a shutdown
+                #   if you get a shutdown right in the middle of a recv you can get a different kind of error
+                #   than if you do a shutdown before
+                #   and of course the errors/bahaviors are all different in different platforms 
+                
+                #if isBadSocket(e):
+                #    break  # almost certainly socket was closed
+                #else:
+                #    raise ConnectionClosed, e
                 
         
     def close(self):
         with self.lock:
             if not self.closed:
                 self.closed = True
-                #self.socket.shutdown(socket.SHUT_RD) # test shutdown WR
-                self.socket.close()
+                try:
+                    self.socket.shutdown(socket.SHUT_RDWR) # test shutdown WR
+                    self.socket.close()
+                except:
+                    pass #TODO maybe add logging here?
 
 
+class StreamClosedBeforeReply(Exception): pass
 
+#  wraps a packet stream 
+#   converts byte packets to pickled python object packets
+#   
+#
 class HNetPickleStream:
     def __init__(self, stream):
         self.stream = stream
     def send(self, obj, responseTo = 0):
         self.stream.send(pickle.dumps(obj), responseTo)
     def sendAndWait(self, obj, responseTo = 0):
-        return self.stream.sendAndWait(pickle.dumps(obj), responseTo)
+        packet = self.stream.sendAndWait(pickle.dumps(obj), responseTo)
+        return mkPacket(pickle.loads(packet.msg()), packet._messageId(), self, None)
     def recv(self):
-        for msg in self.stream.recv():
-            yield pickle.loads(msg)
+        for packet in self.stream.recv():
+            yield mkPacket(pickle.loads(packet.msg()), packet._messageId(), self, None)
     def close():
         self.stream.close()
 
 
-#TODO unify packet and stream somehow (at least on the recieving end)
-#  we can send msg, bigMsg, obj, proxy, stream, it'd be nice to recieve all those without special action
-#  like
-#
-# for msg, aux in recv():  #TODO do I want to use a queue here? and a separate thread to manage the streams?
-#    msg.obj()?, aux.proxy(), .stream(), .bigMsgGetter()
-#    
-#   the msg vs pickled obj should be handled by a wrapper as you shouldn't mix a pickled object and regular msgs
-#   proxy and stream and bigMsgGetter should be in aux
-# 
-#TODO unify our many send methods (send, sendAndWait, sendObj, sendObjAndWait into one)
-#  send, sendFast, sendAndWait
-# TODO put a timeout option on the sendAndWait somehow
-# TODO check streamid negative numbers
-def newStream(startMsg, sendWaitSocket, streamId, recvQueue, ourStream):
-    streamMap = { True : -1 , False : -2 } #TODO improve this, probably replace with constant, and pass in
+OurStream = -1
+TheirStream = -2
+def newStream(startMsg, sendWaitSocket, streamId, recvQueue, streamSource):
     class HNetStream: # can only use with HNetSendWait
         def __init__(self):
+            #TODO add locking here? perhaps put common close functionality in baseclass?
             self.closed = False
         def __del__(self):
             self.close()
         def send(self, msg):
-            sendWaitSocket._send(streamId, msg, streamMap[ourStream])
+            sendWaitSocket._send(streamId, msg, streamSource)
         def recv(self):
             while True:
                 msg = recvQueue.get(True)
+                #print 'recving data', msg
+                
                 if msg == None: break
                 yield msg
-        def close():
+        def close(self):
             if not self.closed:
                 self.closed = True
                 recvQueue.put(None)
-                if ourStream:
-                    sendWaitSocket._send(0, "", streamId) #send stream terminator
-                else:
-                    sendWaitSocket._send(0, "", -streamId) #send stream terminator            
+                try:
+                    if streamSource == OurStream:
+                        sendWaitSocket._send(0, "", -streamId) #send stream terminator
+                    else:
+                        sendWaitSocket._send(0, "", streamId) #send stream terminator 
+                except:
+                    pass
         def msg(self):
             return startMsg
-        
     return HNetStream()
 
-def getProxy(stream):
-    return HNetProxy(HNetSendWait(stream))
-
-def getBigMsg(stream):
-    data = ""
-    for chunk in stream.recv():
-        data += chunk
-    return data
-
+def mkPacket(msg, messageId, parentSocket, stream):
+    class Packet:
+        def respond(_, msg):
+            parentSocket.send(msg, responseTo = messageId)
+        def respondAndWait(_, msg):
+            return parentSocket.sendAndWait(msg, responseTo = messageId)
+        def msg(_):
+            return msg
+        def _messageId(_):
+            return messageId
+        def proxy(_):
+            if stream:
+                return HNetProxy(HNetPickleStream(HNetSendWait(stream)))
+            else:
+                raise Exception("Tried to create proxy on a non-stream object.\nYou were probably expecting a stream but the other side sent a regular message.")
+        def bigMsg(_):
+            if stream:
+                data = ""
+                for chunk in stream.recv():
+                    data += chunk
+                return data
+            else:
+                raise Exception("Tried to create recv bigMsg on a non-stream object.\nYou were probably expecting a stream but the other side sent a regular message.")
+    return Packet()
+    
 class HNetProxy:
     def __init__(self, stream):
         self.stream = stream
         def dummyRead():
-            for packet in stream.recv():
+            for _ in stream.recv():
                 pass
         startNewThread(dummyRead)
     def __getattr__(self, name):
       def messageSender(*args, **kwargs):
-        response = self.stream.sendObjAndWait((name, args, kwargs))
-        e, result = response.obj()
+        packet = self.stream.sendAndWait((name, args, kwargs))
+        (e, result) = packet.msg()
         if e == None:
           return result
         else:
@@ -224,8 +309,6 @@ class HNetProxy:
           raise HNetRemoteException, eArgs 
       return messageSender
 
-# add try...except for socket exceptions
-# what happens if queues fill?
 
 #
 # acceptable interface for stream provides: send(), recv(), and close()
@@ -243,6 +326,7 @@ class HNetSendWait:
         self.closed = False
     def __del__(self):
         self.close()
+        
         
     def _send(self, messageId, msg, responseTo = 0):
         header = struct.pack("!ll", messageId, responseTo)
@@ -265,11 +349,13 @@ class HNetSendWait:
     def send(self, msg, responseTo = 0):
         self._send(self.__nextMessageId(), msg, responseTo)
     
-    def sendAndWait(self, msg, responseTo = 0):
+    def sendAndWait(self, msg, responseTo = 0, timeout = None):
         messageId = self.__nextMessageId()
         self.waiters[messageId] = Queue()
         self._send(messageId, msg, responseTo)
-        resp = self.waiters[messageId].get(True)
+        resp = self.waiters[messageId].get(True, timeout)
+        if resp == None:
+            raise StreamClosedBeforeReply
         del self.waiters[messageId]
         return resp
     
@@ -278,7 +364,7 @@ class HNetSendWait:
         queue = Queue()
         self.waiters[streamId] = queue
         self._send(streamId, msg, responseTo)
-        return newStream(None, self, streamId, queue, True)
+        return newStream(None, self, streamId, queue, OurStream)
         
     def sendBigMsg(self, msg, bigMsg, responseTo = 0):
         stream = self.sendAndStream(msg, responseTo)
@@ -287,48 +373,25 @@ class HNetSendWait:
             bigMsg = bigMsg[1200:]
         stream.send(bigMsg)
         stream.close()
-            
-
-        
-    
-    def sendObj(self, obj, responseTo = 0):
-        self.send(pickle.dumps(obj), responseTo)
-    
-    def sendObjAndWait(self, obj, responseTo = 0):
-        return self.sendAndWait(pickle.dumps(obj), responseTo)
     
     def sendProxy(self, obj, msg = "", responseTo = 0):
-        stream = HNetSendWait(self.sendAndStream(msg, responseTo))
+        stream = HNetPickleStream(HNetSendWait(self.sendAndStream(msg, responseTo)))
         def handleProxyStream():
             for packet in stream.recv():
-                name, args, kwargs = packet.obj()
+                name, args, kwargs = packet.msg()
                 try:
                     if name in [x for x in obj.__class__.__dict__.keys() if x[0] != "_"]:
-                        packet.respondObj( (None, getattr(obj, name)(*args, **kwargs)) )
+                        packet.respond( (None, getattr(obj, name)(*args, **kwargs)) )
                 except Exception,x:
-                    packet.respondObj( ((sys.exc_info()[0], sys.exc_info()[1].args,  ''.join(traceback.format_exception(sys.exc_type, sys.exc_value, sys.exc_traceback))), None) )
-        
+                    packet.respond( ((sys.exc_info()[0], sys.exc_info()[1].args,  ''.join(traceback.format_exception(sys.exc_type, sys.exc_value, sys.exc_traceback))), None) )
         startNewThread(handleProxyStream)
       
     def recv(self):
         for data in self.stream.recv():
             messageId, responseTo = struct.unpack('!ll', data[:8])
             msg = data[8:]
-            class Packet:
-                def respond(_, msg):
-                    self.send(msg, responseTo = messageId)
-                def respondObj(_, obj):
-                    self.sendObj(obj, responseTo = messageId)
-                def respondAndWait(_, msg):
-                    return self.sendAndWait(msg, responseTo = messageId)
-                def respondObjAndWait(_, obj):
-                    return self.sendObjAndWait(obj, responseTo = messageId)
-                def msg(_):
-                    return msg
-                def obj(_):
-                    return pickle.loads(msg)
             if messageId > 0 and responseTo == 0:  # normal packet
-                yield Packet()
+                yield mkPacket(msg, messageId, self, None)
                 
             elif messageId < 0 and responseTo == -1:  #packet on one of their streams,
                 if messageId in self.theirStreams:
@@ -340,38 +403,40 @@ class HNetSendWait:
                     
             elif messageId > 0 and responseTo > 0:  # response packet
                 if responseTo in self.waiters:
-                    self.waiters[responseTo].put(Packet())
+                    self.waiters[responseTo].put(mkPacket(msg, messageId, self, None))
                     
             elif messageId < 0 and responseTo >= 0:  # start of stream packet (might also be a response)
                 queue = Queue()
                 self.theirStreams[messageId] = queue
-                stream = newStream(msg, self, messageId, queue, False)
+                packet = mkPacket(msg, messageId, self, newStream(msg, self, messageId, queue, TheirStream))
                 if responseTo == 0:
-                    yield stream
+                    yield packet
                 else:
-                    self.waiters[messageId].put(stream)
+                    self.waiters[messageId].put(packet)
                 
             elif messageId == 0 and responseTo > 0:  # close their stream
+                responseTo = -responseTo
                 if responseTo in self.theirStreams:
-                    self.theirStreams[-responseTo].put(None)
-                    del self.theirStreams[-responseTo]
+                    self.theirStreams[responseTo].put(None)
+                    del self.theirStreams[responseTo]
                     
             elif messageId == 0 and responseTo < 0:  # close our stream
                 if responseTo in self.waiters:
                     self.waiters[responseTo].put(None)
                     del self.waiters[responseTo]
                     
-            elif messageId == 0 and responseTo == 0:  # close socket # TODO maybe remove this
-                break
-                
-            else:  # meaningless packet, ignore
-                pass
-
+        self.close()
+        
     def close(self):
         with self.lock:
             if not self.closed:
                 self.closed = True
-                #self._send(0,"",0) #test shutdown
+                for q in self.waiters.values():
+                    q.put(None)
+                self.waiters = {}
+                for q in self.theirStreams.values():
+                    q.put(None)
+                self.theirStreams = {}
                 self.stream.close()
             
             
