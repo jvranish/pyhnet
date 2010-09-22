@@ -1,14 +1,12 @@
 import unittest
 import threading
-from threading import Event, Lock, Condition
 import socket
-import select
 import time
 from hnet import *
 
 
 testPort = 30131
-
+# TODO add test cases for replying with streams, proxyies, and bigMsgs
 # sanity checker
 class TestSocket(unittest.TestCase):
     def threadStops(self, thread):
@@ -135,7 +133,7 @@ class TestHNet(unittest.TestCase):
         serverListenSocket.bind(('localhost', testPort))
         serverListenSocket.listen(1)
         def tryConnect():
-            with connectTCP('localhost', testPort, timeout = 0.00001) as s:
+            with connectTCP('localhost', testPort, timeout = 0.00001, socketWrapper = TCPPacketSocket) as s:
                 serverListenSocket.close()
                 s.send('asdf')
             
@@ -150,7 +148,7 @@ class TestHNet(unittest.TestCase):
             s.close()
             
         def forClient(s):
-            self.assertEqual([x for x in s.recv()], ["asdf", "1234", "the quick brown fox jumps over whatever"])
+            self.assertEqual([x for x in s.recvs()], ["asdf", "1234", "the quick brown fox jumps over whatever"])
             s.close()
         self.connectAndRun(forServer, forClient)
         
@@ -163,66 +161,78 @@ class TestHNet(unittest.TestCase):
             s.close()
             
         def forClient(s):
-            for packet in s.recv():
+            for msg in s.recvs():
                 s.close()
 
         self.connectAndRun(forServer, forClient)
         
-    #TODO add case for shutdown while waiting for a response
+    def test_HNetCloseWhileWaiting(self):
         
+        def forServer(s):
+            
+            def runTest(s):
+                def stuff():
+                    s.sendAndWait('asdf')
+                self.assertRaises(StreamClosedBeforeReply, stuff)
+                s.close()
+            
+            for packet in s.recvs():
+                startNewThread(runTest, (s,))
+               
+        def forClient(s):
+            s.send('asdf')
+            for _ in s.recvs():
+                s.close()
+            
+        self.connectAndRun(forServer, forClient, HighLevelTCPSocket)
+    
     def test_HNetProxy(self):
         
         def forServer(s):
-            s = HNetSendWait(s)
             
-            def runTest(s, obj):
-                self.assertEqual(obj.getA(), 5)
-                obj.setA(10)
-                self.assertEqual(obj.getA(), 10)
-                self.assertRaises(TypeError, obj.testError)
-                s.close()
-            
-            for packet in s.recv():
+            for packet in s.recvs():
                 if packet.msg() == 'testProxy':
-                    startNewThread(runTest, (s, packet.proxy()))
+                    obj = packet.proxy()
+                    self.assertEqual(obj.getA(), 5)
+                    obj.setA(10)
+                    self.assertEqual(obj.getA(), 10)
+                    self.assertRaises(TypeError, obj.testError)
+                    s.close()
                
         def forClient(s):
-            s = HNetSendWait(s)
             testObj = TestObj(5)
             s.sendProxy(testObj, 'testProxy')
-            for _ in s.recv():
+            for _ in s.recvs():
                 pass
             
             s.close()
             self.assertEqual(testObj.a, 10)
             
-        self.connectAndRun(forServer, forClient)
+        self.connectAndRun(forServer, forClient, HighLevelTCPSocket)
         
     def test_HNetBigMsg(self):
         bigMsg = 'This is a big message maybe'*5000
         def forServer(s):
-            s = HNetSendWait(s)
             
             def runTest(s, packet):
                 recievedBigMsg = packet.bigMsg()
                 self.assertEqual(bigMsg, recievedBigMsg)
                 s.close()
             
-            for packet in s.recv():
+            for packet in s.recvs():
                 if packet.msg() == 'my big message':
                     startNewThread(runTest, (s, packet))
                
         def forClient(s):
-            s = HNetSendWait(s)
-            startNewThread(s.sendBigMsg, ('my big message', bigMsg))
-            for _ in s.recv():
+            startNewThread(s.sendBigMsg, (bigMsg, 'my big message'))
+            for _ in s.recvs():
                 pass
             
             s.close()
             
-        self.connectAndRun(forServer, forClient)
+        self.connectAndRun(forServer, forClient, HighLevelTCPSocket)
       
-    def connectAndRun(self, serverStuff, clientStuff):
+    def connectAndRun(self, serverStuff, clientStuff, wrapper = TCPPacketSocket):
         serverDone  = Event()
         def handleConnect(serverSocket, addr):
             with serverSocket as s:
@@ -230,11 +240,11 @@ class TestHNet(unittest.TestCase):
                 serverStuff(s)
             serverDone.set()
 
-        server = HNetTCPServer([('', testPort)], handleConnect, 0.001)
+        server = HNetTCPServer([('', testPort)], handleConnect, timeout = 0.001, socketWrapper = wrapper)
         self.listen = server
         server.start()
         def runClientStuff():        
-            with connectTCP('localhost', testPort) as clientSocket:
+            with connectTCP('localhost', testPort, socketWrapper = wrapper) as clientSocket:
                 self.client = clientSocket
                 clientStuff(clientSocket)
         clientThread = startNewThread(runClientStuff)
