@@ -3,10 +3,13 @@ import threading
 import socket
 import time
 from hnet import *
+import example
 
 
 testPort = 30131
-# TODO add test cases for replying with streams, proxyies, and bigMsgs
+#TODO add test cases for replying with streams, proxyies, and bigMsgs
+#TODO add test case for plain TCPSocket
+
 # sanity checker
 class TestSocket(unittest.TestCase):
     def threadStops(self, thread):
@@ -62,11 +65,11 @@ class TestSocket(unittest.TestCase):
             
             
         done.set()
-        serverListenSocket.close()
-        closerThread = startNewThread(closer)
         
+        closerThread = startNewThread(closer)
         clientSocket.recv(1)
         
+        serverListenSocket.close()
         self.threadStops(thread)
         self.threadStops(closerThread)
 
@@ -96,7 +99,7 @@ class TestHNet(unittest.TestCase):
             self.listen.stop()
         
     def test_TCPConnectAndClose(self):
-        def handleConnect(s, addr):
+        def handleConnect(s, addr, server):
             pass
         server = HNetTCPServer([('', testPort)], handleConnect)
         server.start()
@@ -107,11 +110,11 @@ class TestHNet(unittest.TestCase):
         self.threadStops(server.thread)
         
     def test_TCPBindPortInvalid(self):
-        server = HNetTCPServer([('', testPort), ('', testPort)], lambda s, addr: None)
+        server = HNetTCPServer([('', testPort), ('', testPort)], lambda s, addr, server: None)
         self.assertRaises(ServerStartFail, server.start)
         
     def test_TCPBindHostInvalid(self):
-        server = HNetTCPServer([('someInvalidHostName', testPort)], lambda s, addr: None)
+        server = HNetTCPServer([('someInvalidHostName', testPort)], lambda s, addr, server: None)
         self.assertRaises(HostInvalid, server.start)
         
     def test_TCPConnectHostInvalid(self):
@@ -133,8 +136,9 @@ class TestHNet(unittest.TestCase):
         serverListenSocket.bind(('localhost', testPort))
         serverListenSocket.listen(1)
         def tryConnect():
-            with connectTCP('localhost', testPort, timeout = 0.00001, socketWrapper = TCPPacketSocket) as s:
+            with connectTCP('localhost', testPort, socketConstructor = TCPPacketSocket) as s:
                 serverListenSocket.close()
+                time.sleep(0.01)
                 s.send('asdf')
             
         self.assertRaises(ConnectionClosed, tryConnect)
@@ -184,7 +188,7 @@ class TestHNet(unittest.TestCase):
             for _ in s.recvs():
                 s.close()
             
-        self.connectAndRun(forServer, forClient, HighLevelTCPSocket)
+        self.connectAndRun(forServer, forClient, HNetTCPSocket)
     
     def test_HNetProxy(self):
         
@@ -208,7 +212,7 @@ class TestHNet(unittest.TestCase):
             s.close()
             self.assertEqual(testObj.a, 10)
             
-        self.connectAndRun(forServer, forClient, HighLevelTCPSocket)
+        self.connectAndRun(forServer, forClient, HNetTCPSocket)
         
     def test_HNetBigMsg(self):
         bigMsg = 'This is a big message maybe'*5000
@@ -230,21 +234,24 @@ class TestHNet(unittest.TestCase):
             
             s.close()
             
-        self.connectAndRun(forServer, forClient, HighLevelTCPSocket)
+        self.connectAndRun(forServer, forClient, HNetTCPSocket)
+      
+    def test_Example(self):
+        example.runExamples()
       
     def connectAndRun(self, serverStuff, clientStuff, wrapper = TCPPacketSocket):
         serverDone  = Event()
-        def handleConnect(serverSocket, addr):
+        def handleConnect(serverSocket, addr, server):
             with serverSocket as s:
                 self.server = serverSocket
                 serverStuff(s)
             serverDone.set()
 
-        server = HNetTCPServer([('', testPort)], handleConnect, timeout = 0.001, socketWrapper = wrapper)
+        server = HNetTCPServer([('', testPort)], handleConnect, timeout = 0.001, socketConstructor = wrapper)
         self.listen = server
         server.start()
         def runClientStuff():        
-            with connectTCP('localhost', testPort, socketWrapper = wrapper) as clientSocket:
+            with connectTCP('localhost', testPort, socketConstructor = wrapper) as clientSocket:
                 self.client = clientSocket
                 clientStuff(clientSocket)
         clientThread = startNewThread(runClientStuff)

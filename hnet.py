@@ -8,6 +8,8 @@ import traceback
 import errno
 
 #TODO make it possible to reply to streams (not too bad)
+#TODO make a wait for response flag that is passed in, and have send return a wait function
+#   that will either wait for the response, or wait for the send to complete (in the case of streams)
 #TODO add UDP sockets and some nice highlevel abstractions over them 
 #     (send, send and make sure it gets there, send and make sure it gets there in order, proper throttling)
 #TODO make some simple wrappers for other common socket functions (so that people won't usually have to import socket)
@@ -49,10 +51,10 @@ class UnknownServerError(ConnectionError): pass
 class HostInvalid(ConnectionError): pass
 class ServerStartFail(ConnectionError): pass
 
-def HighLevelTCPSocket(s): return HNetPickleStream(HNetSendWait(TCPPacketSocket(s)))
-def TCPPacketSocket(s): return HNetPacketize(HNetTCPSocket(s))
+def HNetTCPSocket(s): return HNetPickleStream(HNetReplyStream(TCPPacketSocket(s)))
+def TCPPacketSocket(s): return HNetPacketStream(TCPSocket(s))
 
-def connectTCP(host, port, maxAttempts = 3, timeout = 1.0, socketWrapper = HighLevelTCPSocket):
+def connectTCP(host, port, maxAttempts = 3, timeout = 1.0, socketConstructor = HNetTCPSocket):
     clientSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     tries = 0
     connectSuccess = False
@@ -73,67 +75,85 @@ def connectTCP(host, port, maxAttempts = 3, timeout = 1.0, socketWrapper = HighL
         except socket.error, e:
             raise ConnectFailed, e
         
-    return socketWrapper(clientSocket)
+    return socketConstructor(clientSocket)
     
 class HNetTCPServer:
-    def __init__(self, addresses, newConnectionHandler, timeout = 0.01, reuseaddr=True, keepalive=True, socketWrapper = HighLevelTCPSocket):
+    def __init__(self, addresses, newConnectionHandler, timeout = 0.1, reuseaddr=True, keepalive=True, socketConstructor = HNetTCPSocket):
         self.stopped = True
+        self.done = Event()
+        self.done.set()
         self.lock = Lock()
         self.socket = None
         self.timeout = timeout
         self.addresses = addresses
         self.handler = newConnectionHandler
         self.thread = None
-        self.socketWrapper = socketWrapper
+        self.socketConstructor = socketConstructor
         self.reuseaddr = reuseaddr
         self.keepalive = keepalive
+        self.onInit()
+        
+    def onInit(self): pass
+    def onStart(self): pass
         
     def __enter__(self): 
         self.start()
         return self
-    def __exit__(self, type, value, traceback): self.stop()
+        
+    def __exit__(self, exc_type, value, traceback): self.stop()
     
+    def onConnect(self, s, addr):
+        h = self.handler(s, addr, self)
+        if isinstance(h, HNetHandler):
+            h.run()
+
     def start(self):
-        if self.stopped:
-            try:
-                self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.stopped = False
-                if self.reuseaddr:
-                    self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                if self.keepalive:
-                    self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                self.socket.settimeout(self.timeout)
-                for address in self.addresses: # (host, port)
-                    self.socket.bind(address)
-                self.socket.listen(5)
-            except socket.gaierror, e:
-                raise HostInvalid, e
-            except socket.error, e:
-                raise ServerStartFail, e
-            except:
-                self.stop()
-                raise
-            self.thread = startNewThread(self.__acceptor)
+        with self.lock:
+            if self.done.isSet():
+                self.done.clear()
+                try:
+                    self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    self.stopped = False
+                    if self.reuseaddr:
+                        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    if self.keepalive:
+                        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                    self.socket.settimeout(self.timeout)
+                    for address in self.addresses: # (host, port)
+                        self.socket.bind(address)
+                    self.socket.listen(5)
+                except socket.gaierror, e:
+                    raise HostInvalid, e
+                except socket.error, e:
+                    raise ServerStartFail, e
+                except:
+                    self.stop()
+                    raise
+                self.thread = startNewThread(self.__acceptor)
                 def __acceptor(self):
         try:
+            self.onStart()
             while not self.stopped:
                 try:
                     conn, addr = self.socket.accept()
-                    startNewThread(self.handler, (self.socketWrapper(conn), addr))
+                    startNewThread(self.onConnect, (self.socketConstructor(conn), addr))
                 except socket.timeout:
                     pass
                 except socket.error, e:
                     if not self.stopped:
                         raise UnknownServerError,  e
         finally:
-            self.stop()
+            self.stop(False)
             self.socket = None
+            self.done.set()
         
-    def stop(self):
+    def stop(self, wait = True):
         with self.lock:
             if not self.stopped:
                 self.stopped = True
                 self.socket.close()
+        if wait:
+            self.done.wait()
 
 
 class StreamInterface:
@@ -142,7 +162,7 @@ class StreamInterface:
         self.closed = False
         
     def __enter__(self): return self
-    def __exit__(self, type, value, traceback): self.close()
+    def __exit__(self, exc_type, value, traceback): self.close()
     def __del__(self): self.close()
     def send(self, *args, **kwargs): raise NotImplementedError, "send needs to be implemented in your superclass"
     def recv(self, *args, **kwargs): raise NotImplementedError, "recv needs to be implemented in your superclass"
@@ -164,9 +184,9 @@ class StreamInterface:
                  
 class StreamWrapperInterface(StreamInterface):
     def __init__(self, stream):
-        self.onInit(stream)
         StreamInterface.__init__(self)
         self.stream = stream
+        self.onInit(stream)
         
     def onInit(self, stream): pass
         
@@ -182,7 +202,7 @@ class PacketStreamInterface(StreamInterface): pass
 class ObjectStreamInterface(StreamWrapperInterface): pass    
                 
 
-class HNetTCPSocket(ByteStreamInterface):
+class TCPSocket(ByteStreamInterface):
     def __init__(self, s):
         ByteStreamInterface.__init__(self)
         self.socket = s
@@ -224,17 +244,20 @@ class HNetTCPSocket(ByteStreamInterface):
 
 
 
-class HNetPacketize(PacketStreamInterface):
+class HNetPacketStream(PacketStreamInterface):
     def __init__(self, stream):
         self.stream = stream
-        if not isinstance(stream, ByteStreamInterface): raise Exception, "HNetPacketize can only wrap byte streams"
+        if not isinstance(stream, ByteStreamInterface): raise Exception, "HNetPacketStream can only wrap byte streams"
         PacketStreamInterface.__init__(self)
+        self.recvLock = Lock()
+        self.sendLock = Lock()
 
-    def onClose(self):
-        self.stream.close()
+    def onClose(self): self.stream.close()
         
     def send(self, data):
-        self.stream.send(struct.pack("!L", len(data)) + data)
+        with self.sendLock: # if sendAll is thread safe then we probably dont need this.
+                            #   We need this to be thread safe because of streams
+            self.stream.send(struct.pack("!L", len(data)) + data)
         
     def __recvDataLen(self, length):
         recvData = []
@@ -247,11 +270,12 @@ class HNetPacketize(PacketStreamInterface):
         return "".join(recvData)
         
     def recv(self):
-        try:
-            length, = struct.unpack('!L', self.__recvDataLen(4))
-            return self.__recvDataLen(length)
-        except ConnectionClosed:
-            return None
+        with self.recvLock:
+            try:
+                length, = struct.unpack('!L', self.__recvDataLen(4))
+                return self.__recvDataLen(length)
+            except ConnectionClosed:
+                return None
 
 
 class StreamError(Exception): pass
@@ -263,7 +287,7 @@ StreamPacket = -1
 CloseStream = -2
 
 def newStream(sendWaitSocket, streamId, recvQueue):
-    class HNetStream(PacketStreamInterface): # can only use with HNetSendWait
+    class HNetStream(PacketStreamInterface): # can only use with HNetReplyStream
         def send(self, msg): sendWaitSocket._send(streamId, msg, StreamPacket)
         def recv(self): return recvQueue.get(True)
         def onClose(self):
@@ -300,7 +324,7 @@ def newPacket(data, messageId, parentSocket, stream):
             return stream
         def proxy(_):
             if stream:
-                return HNetProxy(HNetPickleStream(HNetSendWait(stream)))
+                return HNetProxy(HNetPickleStream(HNetReplyStream(stream)))
             else:
                 raise Exception("Tried to create proxy on a non-stream object.\nYou were probably expecting a stream but the other side sent a regular message.")
         def bigMsg(_):
@@ -314,14 +338,14 @@ def newPacket(data, messageId, parentSocket, stream):
     return Packet()
 
 
-#  wraps a HNetSendWait stream 
+#  wraps a HNetReplyStream stream 
 #   converts packets to pickled python object packets
 #   note that streams and bigMsgs still work with strings of bytes
 class HNetPickleStream(ObjectStreamInterface):
     def onInit(self, stream):
-        if not isinstance(stream, HNetSendWait): raise Exception, "HNetPickleStream can only wrap HNetSendWait (or derivatives)"
+        if not isinstance(stream, HNetReplyStream): raise Exception, "HNetPickleStream can only wrap HNetReplyStream (or derivatives)"
     def send(self, obj, replyTo = NotReply):
-        self.stream.send(pickle.dumps(obj), replyTo)
+        return self.stream.send(pickle.dumps(obj), replyTo)
     def sendAndWait(self, obj, replyTo = NotReply):
         packet = self.stream.sendAndWait(pickle.dumps(obj), replyTo)
         return newPacket(pickle.loads(packet.msg()), packet._messageId(), self, packet._stream())
@@ -333,13 +357,13 @@ class HNetPickleStream(ObjectStreamInterface):
         return self.stream.sendStream(pickle.dumps(obj), replyTo)
         
     def sendBigMsg(self, bigMsg, obj, replyTo = NotReply):
-        self.stream.sendBigMsg(bigMsg, pickle.dumps(obj), replyTo)
+        return self.stream.sendBigMsg(bigMsg, pickle.dumps(obj), replyTo)
          
     def sendProxy(self, obj, objMsg = None, replyTo = NotReply):
-        self.stream.sendProxy(obj, pickle.dumps(objMsg), replyTo)
+        return self.stream.sendProxy(obj, pickle.dumps(objMsg), replyTo)
         
     def waitForStreams(self, timeout = None):
-        self.stream.waitForStreams(timeout)
+        return self.stream.waitForStreams(timeout)
 
 class HNetProxy:
     def __init__(self, stream):
@@ -366,6 +390,7 @@ class HNetProxy:
           raise HNetRemoteException, eArgs 
       return messageSender
 
+# Thread safe counter
 class Counter:
     def __init__(self, intialValue = 0):
         self.initialValue = intialValue - 1 # -1 cause we'll increment before fist return
@@ -379,18 +404,18 @@ class Counter:
                 self.value = self.initialValue
             return self.value
 
-class HNetSendWait(ObjectStreamInterface):
+class HNetReplyStream(ObjectStreamInterface):
     def __init__(self, stream):
-        if not isinstance(stream, PacketStreamInterface): raise Exception, "HNetSendWait can only wrap packet streams"
-        ObjectStreamInterface.__init__(self, stream)
+        if not isinstance(stream, PacketStreamInterface): raise Exception, "HNetReplyStream can only wrap packet streams"
         self.nextMessageId = Counter(1) # we should never have a message 0
         self.waiters = {}
         self.streams = {} # negative streams are ours, positive theirs
         self.nextStreamId = Counter(1) # we should never have a stream 0
         self.recvQueue = Queue()
-        startNewThread(self.recvThread)
         self.streamsFinished = Event()
         self.streamsFinished.set()
+        ObjectStreamInterface.__init__(self, stream)
+        startNewThread(self.recvThread)
         
     def _send(self, messageId, msg, replyTo = NotReply):
         header = struct.pack("!ll", messageId, replyTo)
@@ -417,15 +442,20 @@ class HNetSendWait(ObjectStreamInterface):
         return newStream(self, -streamId, queue)
         
     def sendBigMsg(self, bigMsg, msg = '', replyTo = NotReply):
-        stream = self.sendStream(msg, replyTo)
-        while len(bigMsg) > 12000:
-            stream.send(bigMsg[:1200])
-            bigMsg = bigMsg[1200:]
-        stream.send(bigMsg)
-        stream.close()
+        sendDone = Event()
+        def doSend(bigMsg):
+            stream = self.sendStream(msg, replyTo)
+            while len(bigMsg) > 12000:
+                stream.send(bigMsg[:1200])
+                bigMsg = bigMsg[1200:]
+            stream.send(bigMsg)
+            stream.close()
+            sendDone.set()
+        startNewThread(doSend, (bigMsg,))
+        return sendDone
     
     def sendProxy(self, obj, msg = '', replyTo = NotReply):
-        stream = HNetPickleStream(HNetSendWait(self.sendStream(msg, replyTo)))
+        stream = HNetPickleStream(HNetReplyStream(self.sendStream(msg, replyTo)))
         def handleProxyStream():
             for packet in stream.recvs():
                 name, args, kwargs = packet.msg()
@@ -485,3 +515,46 @@ class HNetSendWait(ObjectStreamInterface):
         self.streams = {}
         self.recvQueue.put(None)
 
+class HNetHandler:
+    def __init__(self, s, addr = None, server = None):
+        self.server = server
+        self.addr = addr
+        self.socket = s
+        self.done = Event()
+        self.onInit()
+        
+    def onInit(self): pass
+        
+    def run(self):
+        self.onRun()
+        startNewThread(self.doConnect)
+        startNewThread(self.startRecv)
+        return self.done
+    
+    def onRun(self): pass
+        
+    def startRecv(self):
+        try:
+            with self.socket:
+                for packet in self.socket.recvs():
+                    self.onRecv(packet)
+        except:
+            self.onError(*sys.exc_info())
+        finally:
+            self.done.set()
+            self.onClose()
+            
+    def doConnect(self):
+        try:
+            with self.socket:
+                self.runConnection()
+        except:
+            self.onError(*sys.exc_info())
+        
+    def runConnection(self): self.done.wait()
+    
+    def onRecv(self, packet): pass
+    def onError(self, exc_type, value, traceback): raise
+    def onClose(self):  pass
+        
+    
