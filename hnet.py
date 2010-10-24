@@ -130,7 +130,7 @@ class HNetTCPServer:
                     self.stop()
                     raise
                 self.thread = startNewThread(self.__acceptor)
-                def __acceptor(self):
+                def __acceptor(self):
         try:
             self.onStart()
             while not self.stopped:
