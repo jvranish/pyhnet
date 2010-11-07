@@ -13,11 +13,14 @@ import errno
 #TODO add UDP sockets and some nice highlevel abstractions over them 
 #     (send, send and make sure it gets there, send and make sure it gets there in order, proper throttling)
 #TODO make some simple wrappers for other common socket functions (so that people won't usually have to import socket)
-#TODO add support for alternate thread libraries
 #TODO add log entries?
 #TODO consider queue fill exceptions (perhaps put timeouts on puts?)
 #TODO figure out a way to kill threads (or throw exceptions to threads), and then make the proxy computations timeout
 #TODO make a wrapper for dumps/loads that throws MetadataError instead of whatever it currently does
+
+def useAlternateThreadLib(lock, event, thread, queue):
+  global Lock, Event, Thread, Queue
+  Lock, Event, Thread, Queue = lock, event, thread, queue
 
 def startNewThread(target, args = (), kwargs = {}):
     thread = Thread(target = target, args = args, kwargs = kwargs)
