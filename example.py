@@ -13,7 +13,7 @@ class FriendsList:
     def addFriend(self, name):
         self.friends.append(name)
         for handler in self.handlers:
-            handler.socket.send('Friend %s, has been added.' % name)
+            handler.send('Friend %s, has been added.' % name)
     def getFriends(self):
         return self.friends
         
@@ -49,15 +49,15 @@ class MyServerHandler(HNetHandler):
         
 class MyClientHandler(HNetHandler):
     def runConnection(self):
-        reply = self.socket.sendAndWait('Hello good fellow!')
+        reply = self.sendAndWait('Hello good fellow!')
         if reply.msg() == 'Good day sir!':
             safePrint('He called me sir!')
         # the sending of a bigMsg in another thread
         #   also bigMsg must be a string of bytes
-        bigMsgFinished = self.socket.sendBigMsg(bigMsg*8, 'big msg')
-        self.socket.send([4, 3, 5, 1]) # can send any pickleable object
-        self.socket.sendBigMsg(bigMsg, 'big msg').wait()
-        reply = self.socket.sendAndWait('May I see your friends list?')
+        bigMsgFinished = self.sendBigMsg(bigMsg*8, 'big msg')
+        self.send([4, 3, 5, 1]) # can send any pickleable object
+        self.sendBigMsg(bigMsg, 'big msg').wait()
+        reply = self.sendAndWait('May I see your friends list?')
         # proxies only forwards methods calls, so you must use getters and setters
         #   most exceptions on the remote end with be trapped and thrown locally
         friends = reply.proxy()

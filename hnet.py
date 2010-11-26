@@ -1,10 +1,11 @@
 import socket
 import pickle
 import struct
-from threading import Lock, Event, Thread
+from threading import Lock, Event, Thread, currentThread
 from Queue import Queue
 import sys
 import traceback
+import itertools
 import errno
 
 #TODO make it possible to reply to streams (not too bad)
@@ -22,8 +23,14 @@ def useAlternateThreadLib(lock, event, thread, queue):
   global Lock, Event, Thread, Queue
   Lock, Event, Thread, Queue = lock, event, thread, queue
 
-def startNewThread(target, args = (), kwargs = {}):
+def startNewThread(target, args = (), kwargs = {}, propogateClientId = True):
     thread = Thread(target = target, args = args, kwargs = kwargs)
+    if propogateClientId:
+      t = currentThread()
+      try:
+        thread.clientData = t.clientData
+      except:
+        thread.clientData = None
     thread.start()
     return thread
 
@@ -80,6 +87,11 @@ def connectTCP(host, port, maxAttempts = 3, timeout = 1.0, socketConstructor = H
         
     return socketConstructor(clientSocket)
     
+class ClientData:
+  def __init__(self, clientId = None, handler = None):
+    self.clientId = clientId
+    self.handler = handler
+    
 class HNetTCPServer:
     def __init__(self, addresses, newConnectionHandler, timeout = 0.1, reuseaddr=True, keepalive=True, socketConstructor = HNetTCPSocket):
         self.stopped = True
@@ -94,6 +106,8 @@ class HNetTCPServer:
         self.socketConstructor = socketConstructor
         self.reuseaddr = reuseaddr
         self.keepalive = keepalive
+        
+        self.clientIds = IdGen()
         self.onInit()
         
     def onInit(self): pass
@@ -106,7 +120,10 @@ class HNetTCPServer:
     def __exit__(self, exc_type, value, traceback): self.stop()
     
     def onConnect(self, s, addr):
+        t = currentThread()
+        t.clientData = ClientData(self.clientIds.nextId())
         h = self.handler(s, addr, self)
+        t.clientData.handler = h
         if isinstance(h, HNetHandler):
             h.run()
 
@@ -132,14 +149,15 @@ class HNetTCPServer:
                 except:
                     self.stop()
                     raise
-                self.thread = startNewThread(self.__acceptor)
-                def __acceptor(self):
+                self.thread = startNewThread(self.__acceptor, propogateClientId = False)
+                
+    def __acceptor(self):
         try:
             self.onStart()
             while not self.stopped:
                 try:
                     conn, addr = self.socket.accept()
-                    startNewThread(self.onConnect, (self.socketConstructor(conn), addr))
+                    startNewThread(self.onConnect, (self.socketConstructor(conn), addr), propogateClientId = False)
                 except socket.timeout:
                     pass
                 except socket.error, e:
@@ -406,6 +424,23 @@ class Counter:
             if self.value > 2147483646: #python integers don't rollover
                 self.value = self.initialValue
             return self.value
+            
+class IdGen:
+    def __init__(self):
+        self.pool = itertools.count()
+        self.oldIds = []
+        self.lock = Lock()
+        
+    def nextId(self):
+      with self.lock: # these locks are probably not needed
+        if self.oldIds:
+          return self.oldIds.pop()
+        else:
+          return self.pool.next()
+        
+    def releaseId(self, id):
+      with self.lock:
+        self.oldIds.append(id)
 
 class HNetReplyStream(ObjectStreamInterface):
     def __init__(self, stream):
@@ -522,9 +557,14 @@ class HNetHandler:
     def __init__(self, s, addr = None, server = None):
         self.server = server
         self.addr = addr
-        self.socket = s
+        self._socket = s
         self.done = Event()
         self.onInit()
+        
+    def __getattr__(self, name):
+      #TODO, is this really a good idea?
+      # and if it is, should use this even more?
+      return getattr(self._socket, name)
         
     def onInit(self): pass
         
@@ -538,8 +578,8 @@ class HNetHandler:
         
     def startRecv(self):
         try:
-            with self.socket:
-                for packet in self.socket.recvs():
+            with self._socket:
+                for packet in self.recvs():
                     self.onRecv(packet)
         except:
             self.onError(*sys.exc_info())
@@ -549,7 +589,7 @@ class HNetHandler:
             
     def doConnect(self):
         try:
-            with self.socket:
+            with self._socket:
                 self.runConnection()
         except:
             self.onError(*sys.exc_info())
@@ -560,4 +600,16 @@ class HNetHandler:
     def onError(self, exc_type, value, traceback): raise
     def onClose(self):  pass
         
+def getClientId():
+  t = currentThread()
+  try:
+    return t.clientData.clientId
+  except:
+    return None
     
+def getHandler():
+  t = currentThread()
+  try:
+    return t.clientData.handler
+  except:
+    return None
