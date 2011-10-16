@@ -1,7 +1,7 @@
 import socket
 import pickle
 import struct
-from threading import Lock, Event, Thread, currentThread
+from threading import Lock, RLock, Event, Thread, currentThread
 from Queue import Queue
 import sys
 import traceback
@@ -414,16 +414,17 @@ class HNetProxy:
 # Thread safe counter
 class Counter:
     def __init__(self, intialValue = 0):
-        self.initialValue = intialValue - 1 # -1 cause we'll increment before fist return
+        self.initialValue = intialValue
         self.value = self.initialValue 
         self.lock = Lock()
         
     def __call__(self):
         with self.lock:
+            value = self.value
             self.value += 1
             if self.value > 2147483646: #python integers don't rollover
                 self.value = self.initialValue
-            return self.value
+            return value
             
 class IdGen:
     def __init__(self):
